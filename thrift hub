@@ -1,0 +1,229 @@
+from flask import Flask, render_template, request, redirect, url_for, flash, session
+from flask_mail import Mail, Message
+from werkzeug.security import generate_password_hash, check_password_hash
+import sqlite3, random
+import os
+
+app = Flask(_name_)
+app.secret_key = 'your_secret_key_here'
+
+# Mail config (example using Gmail)
+app.config['MAIL_SERVER']='smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USERNAME'] = 'your_email@gmail.com'
+app.config['MAIL_PASSWORD'] = 'your_email_password'  # app password recommended
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USE_SSL'] = False
+
+mail = Mail(app)
+
+# ===== Database =====
+def init_db():
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    # Users table
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    phone TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL
+                 )''')
+    # Products table
+    c.execute('''CREATE TABLE IF NOT EXISTS products (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    title TEXT NOT NULL,
+                    category TEXT,
+                    description TEXT,
+                    price REAL,
+                    image_url TEXT
+                 )''')
+    # Purchases table
+    c.execute('''CREATE TABLE IF NOT EXISTS purchases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    product_id INTEGER,
+                    purchase_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                 )''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ===== Helper Functions =====
+def get_products():
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM products ORDER BY id DESC")
+    products = c.fetchall()
+    conn.close()
+    return products
+
+def get_previous_purchases(user_id):
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute("""
+        SELECT p.id, p.title, p.category, p.description, p.price, p.image_url
+        FROM purchases pu
+        JOIN products p ON pu.product_id = p.id
+        WHERE pu.user_id = ?
+        ORDER BY pu.purchase_date DESC
+    """, (user_id,))
+    purchases = c.fetchall()
+    conn.close()
+    return purchases
+
+# ===== Routes =====
+@app.route('/')
+def home():
+    products = get_products()
+    return render_template('index.html', products=products)
+
+# Signup
+@app.route('/signup', methods=['POST'])
+def signup():
+    name = request.form['name']
+    email = request.form['email']
+    phone = request.form['phone']
+    password = request.form['password']
+    hashed = generate_password_hash(password)
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute('INSERT INTO users (name,email,phone,password) VALUES (?,?,?,?)',
+                  (name,email,phone,hashed))
+        conn.commit()
+        conn.close()
+        flash('Signup successful! Please login.','success')
+    except sqlite3.IntegrityError:
+        flash('Email or phone already exists.','danger')
+    return redirect(url_for('home'))
+
+# Login
+@app.route('/login', methods=['POST'])
+def login():
+    identifier = request.form['identifier']
+    password = request.form['password']
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE email=? OR phone=?',(identifier,identifier))
+    user = c.fetchone()
+    conn.close()
+    if user and check_password_hash(user[4], password):
+        session['user_id'] = user[0]
+        session['user_name'] = user[1]
+        flash(f'Welcome {user[1]}!','success')
+    else:
+        flash('Invalid credentials!','danger')
+    return redirect(url_for('home'))
+
+# Logout
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    session.pop('user_name', None)
+    flash('Logged out successfully.','success')
+    return redirect(url_for('home'))
+
+# Forgot Password (demo OTP)
+otp_store = {}
+@app.route('/forgot_password', methods=['POST'])
+def forgot_password():
+    identifier = request.form['identifier']
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE email=? OR phone=?',(identifier,identifier))
+    user = c.fetchone()
+    conn.close()
+    if not user:
+        flash('User not found.','danger')
+        return redirect(url_for('home'))
+    otp = str(random.randint(100000,999999))
+    otp_store[identifier] = otp
+    if '@' in identifier:
+        msg = Message('Your OTP', sender='your_email@gmail.com', recipients=[identifier])
+        msg.body = f'Your OTP is: {otp}'
+        mail.send(msg)
+        flash('OTP sent to your email!','success')
+    else:
+        flash(f'Demo OTP (phone): {otp}','success')
+    session['reset_id'] = identifier
+    return redirect(url_for('home'))
+
+# Verify OTP
+@app.route('/verify_otp', methods=['POST'])
+def verify_otp():
+    otp_input = request.form['otp']
+    identifier = session.get('reset_id')
+    if identifier and otp_input == otp_store.get(identifier):
+        flash('OTP verified! You can reset your password now.','success')
+        session['otp_verified'] = True
+    else:
+        flash('Invalid OTP.','danger')
+    return redirect(url_for('home'))
+
+# Reset Password
+@app.route('/reset_password', methods=['POST'])
+def reset_password():
+    if not session.get('otp_verified'):
+        flash('OTP not verified!','danger')
+        return redirect(url_for('home'))
+    new_pass = request.form['password']
+    hashed = generate_password_hash(new_pass)
+    identifier = session.get('reset_id')
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute('UPDATE users SET password=? WHERE email=? OR phone=?',(hashed,identifier,identifier))
+    conn.commit()
+    conn.close()
+    flash('Password reset successfully!','success')
+    session.pop('otp_verified',None)
+    session.pop('reset_id',None)
+    return redirect(url_for('home'))
+
+# Add New Product (Sell)
+@app.route('/add_product', methods=['POST'])
+def add_product():
+    if 'user_id' not in session:
+        flash('You must be logged in to sell products.','danger')
+        return redirect(url_for('home'))
+    title = request.form['title']
+    category = request.form['category']
+    description = request.form['description']
+    price = float(request.form['price'])
+    image_url = request.form['image_url'] or "https://via.placeholder.com/150"
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute('INSERT INTO products (user_id,title,category,description,price,image_url) VALUES (?,?,?,?,?,?)',
+              (session['user_id'], title, category, description, price, image_url))
+    conn.commit()
+    conn.close()
+    flash(f'Product "{title}" added successfully!','success')
+    return redirect(url_for('home'))
+
+# Previous Purchases
+@app.route('/previous_purchases')
+def previous_purchases():
+    if 'user_id' not in session:
+        flash('Login required to view purchases','danger')
+        return redirect(url_for('home'))
+    purchases = get_previous_purchases(session['user_id'])
+    return render_template('previous_purchases.html', purchases=purchases)
+
+# Reorder Product
+@app.route('/reorder/<int:product_id>')
+def reorder_product(product_id):
+    if 'user_id' not in session:
+        flash('Login required to reorder','danger')
+        return redirect(url_for('home'))
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute('INSERT INTO purchases (user_id, product_id) VALUES (?,?)',(session['user_id'],product_id))
+    conn.commit()
+    conn.close()
+    flash('Product added to your cart for reorder!','success')
+    return redirect(url_for('previous_purchases'))
+
+if _name_ == '_main_':
+    app.run(debug=True)
